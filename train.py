@@ -102,12 +102,39 @@ class ConvBlock(nn.Module):
                 stride=1,
             ),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=(2, 1)),
-            nn.Dropout(0.3),
+            # nn.MaxPool2d(kernel_size=(2, 1)),
+            # nn.Dropout(0.2)
+            # Dropout removed to allow overfitting for grokking
         )
 
     def forward(self, x):
-        return self.block(x)
+        x = self.block(x)
+        print(x.shape)
+        return x
+
+
+class ConvReducBlock(nn.Module):
+    def __init__(self, in_chans, out_chans):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_channels=in_chans,
+                out_channels=out_chans,
+                kernel_size=(3, 3),
+                padding=1,
+                stride=1,
+            ),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            # nn.Dropout(0.2)
+            # Dropout removed to allow overfitting for grokking
+        )
+
+    def forward(self, x):
+        x = self.block(x)
+        print(x.shape)
+        return x
 
 
 class ParkinsonsModel(nn.Module):
@@ -122,18 +149,33 @@ class ParkinsonsModel(nn.Module):
             ConvBlock(in_chans=256, out_chans=512),
         )
 
+        self.reduc_blocks = nn.Sequential(
+            ConvReducBlock(in_chans=512, out_chans=1024),
+            ConvReducBlock(in_chans=1024, out_chans=2048),
+            ConvReducBlock(in_chans=2048, out_chans=4096),
+            ConvReducBlock(in_chans=4096, out_chans=8192),
+        )
+
         self.project = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(2560, 64),
+            nn.Linear(81920, 64),
             nn.ReLU(),
-            nn.Dropout(0.5),
+            # Dropout removed to allow overfitting for grokking
             nn.Linear(64, 1),
             nn.Sigmoid(),
         )
 
     def forward(self, x):
+        print("================================")
+        print(f"Input shape: {x.shape}")
         x = self.blocks(x)
+
+        print(f"Pre-reduc shape: {x.shape}")
+        x = self.reduc_blocks(x)
         x = self.project(x)
+
+        print(f"Output shape: {x.shape}")
+        print("================================")
 
         return x
 
@@ -141,21 +183,18 @@ class ParkinsonsModel(nn.Module):
 # %%
 model = ParkinsonsModel().to(device)
 print(f"Model moved to {device}")
+# Weight decay is crucial for grokking - it encourages eventual generalization
 optimizer = torch.optim.AdamW(
     model.parameters(),
     lr=1e-4,
+    weight_decay=0.1,  # Added for grokking
 )
+print("Optimizer configured with weight_decay=0.1 for grokking")
 
 
 losses = []
-val_losses = []
 val_accuracies = []
-
-# %%
-# Create checkpoints directory
-import os
-
-os.makedirs("checkpoints", exist_ok=True)
+val_losses = []
 
 # %%
 BATCH_SIZE = 32
@@ -197,11 +236,114 @@ for i in range(5_000_000):
         torch.save(checkpoint, f"checkpoints/checkpoint_epoch_{i}.pt")
         print(f"Checkpoint saved at epoch {i}")
 
+        # Save smoothed plots on single graph with dual y-axes
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+
+        # Smooth by averaging every 100 epochs
+        num_bins = len(losses) // 100
+        smoothed_losses = torch.tensor(losses[: num_bins * 100]).view(-1, 100).mean(1)
+        smoothed_val_losses = (
+            torch.tensor(val_losses[: num_bins * 100]).view(-1, 100).mean(1)
+        )
+        smoothed_val_acc = (
+            torch.tensor(val_accuracies[: num_bins * 100]).view(-1, 100).mean(1)
+        )
+
+        epochs = range(len(smoothed_losses))
+
+        # Plot losses on left y-axis
+        ax1.set_xlabel("Epoch (x100)", fontsize=12)
+        ax1.set_ylabel("Loss", color="black", fontsize=12)
+        line1 = ax1.plot(
+            epochs,
+            smoothed_losses.numpy(),
+            label="Training Loss",
+            color="blue",
+            linewidth=2,
+        )
+        line2 = ax1.plot(
+            epochs,
+            smoothed_val_losses.numpy(),
+            label="Validation Loss",
+            color="orange",
+            linewidth=2,
+        )
+        ax1.tick_params(axis="y", labelcolor="black")
+        ax1.grid(True, alpha=0.3)
+
+        # Create second y-axis for accuracy
+        ax2 = ax1.twinx()
+        ax2.set_ylabel("Accuracy", color="green", fontsize=12)
+        line3 = ax2.plot(
+            epochs,
+            smoothed_val_acc.numpy(),
+            label="Validation Accuracy",
+            color="green",
+            linewidth=2,
+        )
+        ax2.tick_params(axis="y", labelcolor="green")
+
+        # Combine legends from both axes
+        lines = line1 + line2 + line3
+        labels = [l.get_label() for l in lines]
+        ax1.legend(lines, labels, loc="best", fontsize=10)
+
+        plt.title(f"Training Progress (Epoch {i})", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+
+        plt.savefig(f"checkpoints/training_plot_epoch_{i}.png", dpi=150)
+
+        plt.close()
+        print(f"Training plot saved at epoch {i}")
 
 # %%
-plt.plot(torch.tensor(losses[:-77]).view(-1, 10).mean(1))
-plt.plot(torch.tensor(val_losses[:-77]).view(-1, 10).mean(1))
-plt.plot(val_accuracies)
+# Plot all metrics on single graph with dual y-axes
+fig, ax1 = plt.subplots(figsize=(12, 6))
+
+# Smooth by averaging every 100 epochs
+num_bins = len(losses) // 100
+smoothed_losses = torch.tensor(losses[: num_bins * 100]).view(-1, 100).mean(1)
+smoothed_val_losses = torch.tensor(val_losses[: num_bins * 100]).view(-1, 100).mean(1)
+smoothed_val_acc = torch.tensor(val_accuracies[: num_bins * 100]).view(-1, 100).mean(1)
+
+epochs = range(len(smoothed_losses))
+
+# Plot losses on left y-axis
+ax1.set_xlabel("Epoch (x100)", fontsize=12)
+ax1.set_ylabel("Loss", color="black", fontsize=12)
+line1 = ax1.plot(
+    epochs, smoothed_losses.numpy(), label="Training Loss", color="blue", linewidth=2
+)
+line2 = ax1.plot(
+    epochs,
+    smoothed_val_losses.numpy(),
+    label="Validation Loss",
+    color="orange",
+    linewidth=2,
+)
+ax1.tick_params(axis="y", labelcolor="black")
+ax1.grid(True, alpha=0.3)
+
+# Create second y-axis for accuracy
+ax2 = ax1.twinx()
+ax2.set_ylabel("Accuracy", color="green", fontsize=12)
+line3 = ax2.plot(
+    epochs,
+    smoothed_val_acc.numpy(),
+    label="Validation Accuracy",
+    color="green",
+    linewidth=2,
+)
+ax2.tick_params(axis="y", labelcolor="green")
+
+# Combine legends from both axes
+lines = line1 + line2 + line3
+labels = [l.get_label() for l in lines]
+
+ax1.legend(lines, labels, loc="best", fontsize=10)
+plt.show()
+
+plt.tight_layout()
 
 # %%
 model.eval()
